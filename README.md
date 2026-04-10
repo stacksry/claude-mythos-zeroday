@@ -1,6 +1,6 @@
 # Claude Mythos — Zero Day Hacks: Mitigations & Fixes
 
-A structured research project for tracking, analyzing, and mitigating zero-day vulnerabilities. This repo contains research findings, mitigation strategies, and fixes.
+A structured research and automation project for tracking, analyzing, mitigating, and auto-remediating zero-day vulnerabilities — inspired by [Project Glasswing](https://www.anthropic.com/glasswing).
 
 ---
 
@@ -8,18 +8,71 @@ A structured research project for tracking, analyzing, and mitigating zero-day v
 
 ```
 claude-mythos-zeroday/
+├── agents/          # Automated remediation pipeline (see below)
 ├── research/        # Vulnerability research, CVE analysis, threat intel
 ├── exploits/        # Proof-of-concept exploit documentation (for reference)
 ├── mitigations/     # Mitigation strategies and defensive measures
 ├── fixes/           # Patches, code fixes, and remediation scripts
-├── tools/           # Scripts and tools used in analysis
-├── reports/         # Final reports and writeups
-└── docs/            # Supporting documentation
+├── tools/           # Scripts and tools used in analysis (C, Java)
+├── reports/         # Auto-generated remediation reports
+└── docs/            # Supporting documentation and templates
 ```
 
 ---
 
-## Workflow
+## Automated Remediation Pipeline
+
+The `agents/` directory contains a multi-agent system powered by **Claude Opus 4.6** that automates the full remediation lifecycle across a GitHub organization.
+
+### Architecture
+
+```
+orchestrator.py          ← entry point, loops through the hacks roster
+├── scanner_agent.py     ← scans all org repos for vulnerable patterns
+├── fixer_agent.py       ← applies fix + opens a PR per impacted repo
+├── tester_agent.py      ← asserts the fix is correct via PR diff inspection
+└── reporter_agent.py    ← generates a scored hygiene report
+hack_registry.py         ← auto-loads hacks from research/ + fixes/
+github_tools.py          ← GitHub API wrappers (scan, branch, PR, CI status)
+```
+
+### How It Works
+
+| Step | Agent | What it does |
+|---|---|---|
+| 1 | **Scanner** | Code-searches the GitHub org for each vulnerability pattern, reads matching files, filters false positives |
+| 2 | **Fixer** | Reads the vulnerable file, generates a minimal targeted fix, creates a branch, opens a PR |
+| 3 | **Tester** | Reads the PR diff, verifies the vulnerable pattern is removed and the fix is correctly applied |
+| 4 | **Reporter** | Calculates a hygiene score (0–100), generates a full markdown report with action items |
+
+Each agent uses `claude-opus-4-6` with **adaptive thinking** for deep reasoning on complex code.
+
+### Setup
+
+```bash
+cd agents/
+cp .env.example .env      # add ANTHROPIC_API_KEY + GITHUB_TOKEN
+pip install -r requirements.txt
+```
+
+### Usage
+
+```bash
+# Scan only — no PRs created
+python orchestrator.py --org your-github-org --dry-run
+
+# Full pipeline: scan → fix → test → report
+python orchestrator.py --org your-github-org
+
+# Run against a single hack
+python orchestrator.py --org your-github-org --hack java-deserialization
+```
+
+Reports are saved to `reports/remediation_<timestamp>.md`.
+
+---
+
+## Manual Workflow
 
 1. **Research** — Document the vulnerability in `research/`
 2. **Reproduce** — Record PoC details in `exploits/`
@@ -41,11 +94,13 @@ claude-mythos-zeroday/
 
 ---
 
-## Status Tracking
+## Current Hacks Roster
 
-| Vulnerability | Research | PoC | Mitigation | Fix | Report |
-|---|---|---|---|---|---|
-| _(add entries here)_ | | | | | |
+| Vulnerability | Language | Severity | Research | PoC | Mitigation | Fix | Agent |
+|---|---|---|---|---|---|---|---|
+| FFmpeg Out-of-Bounds Write | C | High | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Java Unsafe Deserialization → RCE | Java | Critical | ✅ | ✅ | — | ✅ | ✅ |
+| _(add entries here)_ | | | | | | | |
 
 ---
 
