@@ -3,3 +3,4 @@ PyGitHub>=2.3.0
 python-dotenv>=1.0.0
 requests>=2.31.0
 docker>=7.0.0          # sandbox_agent: Docker SDK for Python
+mcp[cli]>=1.0.0        # mcp_server: MCP protocol for VS Code Copilot integration

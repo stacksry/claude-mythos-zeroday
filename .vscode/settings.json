@@ -1,0 +1,5 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/agents/.venv/bin/python",
+  "python.analysis.extraPaths": ["${workspaceFolder}/agents"],
+  "github.copilot.chat.agent.mcp.enabled": true
+}
