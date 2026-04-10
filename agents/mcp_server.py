@@ -356,6 +356,92 @@ async def glasswing_get_report() -> str:
 
 
 @mcp.tool()
+async def glasswing_correct_cvss(
+    finding_id: str,
+    corrected_score: float,
+    corrected_vector: str,
+    reason: str,
+) -> str:
+    """
+    Override the CVSS score for a finding and record the correction for future calibration.
+
+    This is the human feedback mechanism — when a triage agent gets the severity wrong,
+    call this tool to correct it. The correction is stored in memory and used to calibrate
+    future CVSS scoring for the same vulnerability class.
+
+    Args:
+        finding_id: The finding ID to correct (full or prefix)
+        corrected_score: The correct CVSS base score (0.0–10.0)
+        corrected_vector: The correct CVSS v3.1 vector string
+        reason: Why the original score was wrong (used as future calibration context)
+
+    Returns:
+        Confirmation of correction applied and stored.
+    """
+    triage_dir = REPO_ROOT / "reports" / "triage"
+    matches = [f for f in triage_dir.glob("*.json") if f.stem.startswith(finding_id)]
+
+    if not matches:
+        return f"No finding found matching ID '{finding_id}'."
+
+    try:
+        data = json.loads(matches[0].read_text())
+    except Exception as exc:
+        return f"Error reading record: {exc}"
+
+    original_score = data.get("cvss_score", 0.0)
+    original_vector = data.get("cvss_vector", "")
+    hack_id = data.get("hack_id", "")
+
+    # Update the triage record on disk
+    data["cvss_score"] = corrected_score
+    data["cvss_vector"] = corrected_vector
+    matches[0].write_text(json.dumps(data, indent=2))
+
+    # Write to memory for future calibration
+    import memory_agent as mem
+    mem.record_cvss_correction(
+        hack_id=hack_id,
+        original_score=original_score,
+        corrected_score=corrected_score,
+        original_vector=original_vector,
+        corrected_vector=corrected_vector,
+        reason=reason,
+    )
+
+    return (
+        f"CVSS corrected for `{data['finding_id']}`:\n"
+        f"- Was   : {original_score} ({original_vector})\n"
+        f"- Now   : {corrected_score} ({corrected_vector})\n"
+        f"- Reason: {reason}\n\n"
+        f"Correction stored in memory — future `{hack_id}` triage will use this calibration."
+    )
+
+
+@mcp.tool()
+async def glasswing_memory_stats() -> str:
+    """
+    Show what the pipeline has learned so far across all feedback loops.
+
+    Returns a summary of stored memory: fix patterns, false positive signals,
+    CVSS corrections, ranker calibrations, and confirmed scan patterns.
+    """
+    import memory_agent as mem
+    stats = mem.get_store().stats()
+    lines = ["## Glasswing Memory Store\n"]
+    total = sum(stats.values())
+    for key, count in stats.items():
+        label = key.replace("_", " ").title()
+        lines.append(f"- {label:<30} {count} record(s)")
+    lines.append(f"\n**Total:** {total} records across {len(stats)} feedback loops")
+    if total == 0:
+        lines.append("\nNo memory yet — run the pipeline to start learning.")
+    else:
+        lines.append(f"\nMemory location: `{mem.MEMORY_DIR}`")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def glasswing_alert_test() -> str:
     """
     Smoke-test the alert channels (Slack, email, PagerDuty) with a fake Critical finding.

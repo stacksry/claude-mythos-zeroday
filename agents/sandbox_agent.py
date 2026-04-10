@@ -24,6 +24,7 @@ from typing import Optional
 import anthropic
 from triage_agent import TriageRecord
 from hack_registry import Hack
+import memory_agent as mem
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -457,6 +458,18 @@ def run_sandbox(record: TriageRecord, file_content: str = "", hack: Optional[Hac
             "CONFIRMED_EXPLOITABLE for %s — indicator: %r", finding_id, indicator
         )
         verdict = "CONFIRMED_EXPLOITABLE"
+        # ── Write memory: record the confirming code pattern ──────────────────
+        if hack and poc_code:
+            # Extract a short representative pattern from the PoC code
+            poc_lines = [l.strip() for l in poc_code.splitlines() if l.strip() and not l.strip().startswith("//") and not l.strip().startswith("#")]
+            pattern_line = poc_lines[0] if poc_lines else poc_code[:80]
+            mem.record_confirmed_scan_pattern(
+                hack_id=hack.id,
+                pattern=pattern_line[:120],
+                language=poc_language,
+                crash_indicator=indicator,
+                confirmed_by="sandbox",
+            )
     else:
         logger.info("NOT_REPRODUCIBLE for %s — no crash indicators found", finding_id)
         verdict = "NOT_REPRODUCIBLE"

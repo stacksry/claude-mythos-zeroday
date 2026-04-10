@@ -18,6 +18,7 @@ Only files scored >= MIN_SCORE are passed to the scanner.
 import json
 import anthropic
 import github_tools as gh
+import memory_agent as mem
 
 
 MODEL = "claude-opus-4-6"
@@ -136,6 +137,11 @@ def rank(repo_full_name: str, vuln_language: str = "") -> list[dict]:
     Returns list of {path, score, reason} sorted by score descending.
     """
     client = anthropic.Anthropic()
+
+    # ── Read memory: inject ranker calibration examples ───────────────────────
+    calibration_examples = mem.get_ranker_examples()
+    system = SYSTEM_PROMPT + calibration_examples if calibration_examples else SYSTEM_PROMPT
+
     messages = [
         {
             "role": "user",
@@ -151,7 +157,7 @@ def rank(repo_full_name: str, vuln_language: str = "") -> list[dict]:
         response = client.messages.create(
             model=MODEL,
             max_tokens=8192,
-            system=SYSTEM_PROMPT,
+            system=system,
             tools=TOOLS,
             messages=messages,
         )

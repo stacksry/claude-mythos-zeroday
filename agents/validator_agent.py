@@ -21,6 +21,7 @@ Achieves the Mythos benchmark: >89% exact severity agreement with human triagers
 import json
 import anthropic
 from hack_registry import Hack
+import memory_agent as mem
 
 
 MODEL = "claude-opus-4-6"
@@ -101,11 +102,15 @@ def validate(finding: dict, hack: Hack, file_content: str = "") -> dict:
         "Please validate this bug report and return your verdict JSON."
     )
 
+    # ── Read memory: inject known false positive signals ──────────────────────
+    fp_signals = mem.get_false_positive_signals(hack.id)
+    system = SYSTEM_PROMPT + fp_signals if fp_signals else SYSTEM_PROMPT
+
     response = client.messages.create(
         model=MODEL,
         max_tokens=2048,
         thinking={"type": "adaptive"},
-        system=SYSTEM_PROMPT,
+        system=system,
         messages=[{"role": "user", "content": report_text}],
     )
 
@@ -155,7 +160,6 @@ def validate_batch(findings: list[dict], hack: Hack) -> list[dict]:
 
         if verdict in ("CONFIRMED", "DOWNGRADED"):
             finding["validation"] = result
-            # Use adjusted severity if downgraded
             if verdict == "DOWNGRADED" and result.get("adjusted_severity"):
                 finding["severity"] = result["adjusted_severity"]
             else:
@@ -165,6 +169,17 @@ def validate_batch(findings: list[dict], hack: Hack) -> list[dict]:
             finding["validation"] = result
             finding["severity"] = hack.severity
             finding["needs_human_review"] = True
-            confirmed.append(finding)  # pass through for human triage
+            confirmed.append(finding)
+        elif verdict == "REJECTED":
+            # ── Write memory: record what made this a false positive ──────────
+            rejection_reason = result.get("rejection_reason", "false_positive") or "false_positive"
+            reasoning = result.get("reasoning", "")
+            if reasoning:
+                mem.record_false_positive(
+                    hack_id=hack.id,
+                    file_path=finding.get("file", ""),
+                    rejection_reason=rejection_reason,
+                    signal=reasoning[:300],
+                )
 
     return confirmed

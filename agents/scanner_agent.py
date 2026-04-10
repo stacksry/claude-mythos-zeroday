@@ -20,6 +20,7 @@ import json
 import anthropic
 from hack_registry import Hack, AffectedLibrary
 import github_tools as gh
+import memory_agent as mem
 
 
 MODEL = "claude-opus-4-6"
@@ -242,6 +243,15 @@ def scan(org_name: str, hack: Hack) -> list[dict]:
     Run the structured 6-layer scanner for a hack against the given GitHub org.
     Returns list of impacted repos with full discovery context.
     """
+    # ── Read memory: extend scan_patterns with sandbox-confirmed patterns ─────
+    learned_patterns = mem.get_confirmed_patterns(hack.id)
+    if learned_patterns:
+        # Extend without mutating the shared Hack object
+        hack = Hack(
+            **{k: v for k, v in hack.__dict__.items() if k != "scan_patterns"},
+            scan_patterns=list(dict.fromkeys(hack.scan_patterns + learned_patterns)),
+        )
+
     client = anthropic.Anthropic()
 
     messages = [

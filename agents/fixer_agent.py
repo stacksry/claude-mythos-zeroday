@@ -10,6 +10,7 @@ import json
 import anthropic
 from hack_registry import Hack
 import github_tools as gh
+import memory_agent as mem
 
 
 MODEL = "claude-opus-4-6"
@@ -113,6 +114,10 @@ def apply_fix(repo_full_name: str, impacted_file: str, hack: Hack) -> dict:
     client = anthropic.Anthropic()
     branch_name = f"glasswing/fix-{hack.id}"
 
+    # ── Read memory: inject proven fix patterns from previous runs ────────────
+    file_ext = "." + impacted_file.rsplit(".", 1)[-1] if "." in impacted_file else ""
+    fix_examples = mem.get_fix_examples(hack.id, hack.language)
+
     messages = [
         {
             "role": "user",
@@ -124,17 +129,21 @@ def apply_fix(repo_full_name: str, impacted_file: str, hack: Hack) -> dict:
                 f"**Vulnerable file:** {impacted_file}\n\n"
                 f"**Fix strategy:**\n{hack.fix_description}\n\n"
                 f"**Full fix reference:**\n{hack.raw_fix[:2000]}\n\n"
-                "Instructions:\n"
+                + fix_examples +
+                "\nInstructions:\n"
                 f"1. Fetch the content of `{impacted_file}` from `{repo_full_name}`.\n"
                 f"2. Create a new branch named `{branch_name}` (base: main).\n"
                 "3. Apply the fix to the file content — make the minimal targeted change "
                 "   that eliminates the vulnerability. Do NOT refactor unrelated code.\n"
+                "   Prefer proven fix patterns above when they match the vulnerable code.\n"
                 "4. Update the file on the fix branch with a clear commit message.\n"
                 "5. Open a PR with:\n"
                 f"   - title: `[Glasswing] Fix {hack.title} in {impacted_file}`\n"
                 "   - body: explain what was changed and why, reference the vulnerability.\n"
                 "6. Return a JSON object: "
-                '{"success": true/false, "pr_url": "...", "branch": "...", "notes": "..."}\n'
+                '{"success": true/false, "pr_url": "...", "branch": "...", '
+                '"vulnerable_snippet": "...", "fix_snippet": "...", "notes": "..."}\n'
+                "Include the key lines of vulnerable code and the fix in the JSON.\n"
                 "Return ONLY the JSON object as your final answer."
             ),
         }
@@ -156,7 +165,19 @@ def apply_fix(repo_full_name: str, impacted_file: str, hack: Hack) -> dict:
                     try:
                         start = text.index("{")
                         end = text.rindex("}") + 1
-                        return json.loads(text[start:end])
+                        result = json.loads(text[start:end])
+                        # ── Write memory: record fix pattern on success ────────
+                        if result.get("success") and result.get("vulnerable_snippet") and result.get("fix_snippet"):
+                            mem.record_fix_pattern(
+                                hack_id=hack.id,
+                                language=hack.language,
+                                file_extension=file_ext,
+                                vulnerable_snippet=result["vulnerable_snippet"],
+                                fix_snippet=result["fix_snippet"],
+                                repo=repo_full_name,
+                                confirmed_by="fixer_agent",
+                            )
+                        return result
                     except (ValueError, json.JSONDecodeError):
                         return {"success": False, "pr_url": None, "branch": branch_name,
                                 "notes": f"Could not parse result: {text[:200]}"}

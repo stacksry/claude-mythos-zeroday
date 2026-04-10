@@ -22,6 +22,7 @@ from typing import Optional
 from pathlib import Path
 import anthropic
 from hack_registry import Hack
+import memory_agent as mem
 
 
 MODEL = "claude-opus-4-6"
@@ -89,6 +90,11 @@ Return JSON: {"score": 7.5, "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}"""
 def _score_cvss(finding: dict, hack: Hack) -> tuple[float, str]:
     """Ask Claude to generate a CVSS score for a finding."""
     client = anthropic.Anthropic()
+
+    # ── Read memory: inject CVSS correction examples ──────────────────────────
+    cvss_examples = mem.get_cvss_examples(hack.id)
+    system = CVSS_SYSTEM + cvss_examples if cvss_examples else CVSS_SYSTEM
+
     prompt = (
         f"Vulnerability: {hack.title}\n"
         f"Severity label: {finding.get('severity', hack.severity)}\n"
@@ -101,7 +107,7 @@ def _score_cvss(finding: dict, hack: Hack) -> tuple[float, str]:
     response = client.messages.create(
         model=MODEL,
         max_tokens=256,
-        system=CVSS_SYSTEM,
+        system=system,
         messages=[{"role": "user", "content": prompt}],
     )
     for block in response.content:
@@ -159,6 +165,23 @@ def triage(finding: dict, hack: Hack) -> TriageRecord:
     TRIAGE_DIR.mkdir(parents=True, exist_ok=True)
     record_path = TRIAGE_DIR / f"{finding_id}.json"
     record_path.write_text(json.dumps(asdict(record), indent=2))
+
+    # ── Write memory: ranker calibration if file was ranked below severity ────
+    ranked_score = finding.get("ranked_score")
+    if ranked_score is not None:
+        file_path = finding.get("file", "")
+        file_ext = "." + file_path.rsplit(".", 1)[-1] if "." in file_path else ""
+        mem.record_ranker_calibration(
+            file_path=file_path,
+            file_extension=file_ext,
+            ranked_score=int(ranked_score),
+            actual_severity=severity,
+            hack_id=hack.id,
+            lesson=(
+                f"{hack.title} found in {file_path} — "
+                f"this file type ({file_ext}) should score higher for {hack.id}"
+            ),
+        )
 
     return record
 
