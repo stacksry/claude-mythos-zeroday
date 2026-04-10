@@ -2,10 +2,11 @@
 hack_registry.py
 
 Loads vulnerability definitions from the research/ and fixes/ directories.
-Each hack entry pairs a research doc with its corresponding fix doc.
+Each Hack entry carries structured discovery metadata so the scanner can
+check infra, OS, language, framework, and library versions before doing
+code-level pattern matching.
 """
 
-import os
 import re
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -16,91 +17,135 @@ REPO_ROOT = Path(__file__).parent.parent
 
 
 @dataclass
+class AffectedLibrary:
+    """A library/package that exposes the vulnerability when present."""
+    name: str                          # e.g. "commons-collections"
+    ecosystem: str                     # maven | npm | pypi | go | gem | cargo | nuget
+    vulnerable_versions: str           # semver range, e.g. "< 3.2.2" or ">= 4.0, < 4.1"
+    safe_version: Optional[str] = None # e.g. "3.2.2"
+
+
+@dataclass
 class Hack:
-    id: str                        # e.g. "2026-04-10_ffmpeg-oob-write"
-    title: str                     # e.g. "FFmpeg Out-of-Bounds Write"
-    severity: str                  # Critical / High / Medium / Low
-    language: str                  # c, java, python, etc.
-    scan_patterns: list[str]       # code patterns to search in org repos
-    fix_description: str           # what the fix does
-    research_path: Path
+    id: str                            # e.g. "2026-04-10_ffmpeg-oob-write"
+    title: str                         # e.g. "FFmpeg Out-of-Bounds Write"
+    severity: str                      # Critical / High / Medium / Low
+    language: str                      # c, java, python, javascript, go, ruby, etc.
+
+    # ── Discovery layers ────────────────────────────────────────────────────
+    # Layer 1 – Infrastructure signals
+    infra_signals: list[str] = field(default_factory=list)
+    # e.g. ["Dockerfile", "docker-compose.yml", "*.tf", ".github/workflows"]
+
+    # Layer 2 – OS signals
+    os_signals: list[str] = field(default_factory=list)
+    # e.g. ["FROM debian", "FROM ubuntu:20", "runs-on: ubuntu"]
+
+    # Layer 3 – Language / runtime files
+    language_files: list[str] = field(default_factory=list)
+    # e.g. ["pom.xml", "*.java"] or ["package.json", "*.js"]
+
+    # Layer 4 – Framework signals
+    framework_signals: list[str] = field(default_factory=list)
+    # e.g. ["spring-boot", "django", "express", "rails"]
+
+    # Layer 5 – Affected libraries + version ranges
+    affected_libraries: list[AffectedLibrary] = field(default_factory=list)
+
+    # Layer 6 – Code-level patterns (final confirmation)
+    scan_patterns: list[str] = field(default_factory=list)
+
+    # ── Fix metadata ─────────────────────────────────────────────────────────
+    fix_description: str = ""
+    research_path: Optional[Path] = None
     fix_path: Optional[Path] = None
     raw_research: str = ""
     raw_fix: str = ""
 
 
-def _extract_field(text: str, field: str) -> str:
-    """Pull a value from markdown frontmatter or bold headers."""
-    match = re.search(rf"\*\*{field}:\*\*\s*(.+)", text)
-    if match:
-        return match.group(1).strip()
-    match = re.search(rf"{field}:\s*(.+)", text)
-    if match:
-        return match.group(1).strip()
+# ---------------------------------------------------------------------------
+# Built-in discovery profiles for known vulnerability classes
+# ---------------------------------------------------------------------------
+
+_PROFILES: dict[str, dict] = {
+    "deserialization": {
+        "infra_signals": ["Dockerfile", "docker-compose.yml", ".github/workflows/*.yml"],
+        "os_signals": ["FROM openjdk", "FROM eclipse-temurin", "FROM amazoncorretto"],
+        "language_files": ["pom.xml", "build.gradle", "*.java"],
+        "framework_signals": ["spring-boot", "struts", "jboss", "weblogic", "jenkins"],
+        "affected_libraries": [
+            AffectedLibrary("commons-collections", "maven", "< 3.2.2", "3.2.2"),
+            AffectedLibrary("commons-collections4", "maven", "< 4.1", "4.1"),
+            AffectedLibrary("spring-core", "maven", ">= 4.0, < 5.3.18", "5.3.18"),
+            AffectedLibrary("jackson-databind", "maven", "< 2.14.0", "2.14.0"),
+            AffectedLibrary("xstream", "maven", "< 1.4.19", "1.4.19"),
+        ],
+        "scan_patterns": ["new ObjectInputStream(", "readObject()", ".readObject()"],
+    },
+    "oob": {
+        "infra_signals": ["Dockerfile", "Makefile", ".github/workflows/*.yml"],
+        "os_signals": ["FROM ubuntu", "FROM debian", "FROM alpine"],
+        "language_files": ["*.c", "*.h", "CMakeLists.txt", "Makefile", "configure.ac"],
+        "framework_signals": ["libav", "ffmpeg", "gstreamer", "vlc"],
+        "affected_libraries": [
+            AffectedLibrary("ffmpeg", "apt", "< 6.1.2", "6.1.2"),
+            AffectedLibrary("libavcodec", "apt", "< 6.1.2", "6.1.2"),
+        ],
+        "scan_patterns": [
+            "malloc(width * height)",
+            "for (int i = 0; i < num_planes",
+            "buf[i] = ",
+        ],
+    },
+}
+
+
+def _match_profile(research_text: str, stem: str) -> str:
+    """Return the best matching profile key for a research doc."""
+    text = research_text.lower() + stem.lower()
+    if "deserialization" in text or "readobject" in text:
+        return "deserialization"
+    if "out-of-bounds" in text or "oob" in text or "ffmpeg" in text:
+        return "oob"
+    return ""
+
+
+def _extract_field(text: str, key: str) -> str:
+    for pattern in [rf"\*\*{key}:\*\*\s*(.+)", rf"{key}:\s*(.+)"]:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1).strip()
     return ""
 
 
 def _infer_language(text: str, filename: str) -> str:
-    """Guess the primary language from the research doc content."""
-    text_lower = text.lower() + filename.lower()
-    if "java" in text_lower and "jvm" in text_lower:
+    t = text.lower() + filename.lower()
+    if "java" in t or "jvm" in t:
         return "java"
-    if "java" in text_lower:
-        return "java"
-    if ".c " in text_lower or "c/c++" in text_lower or "ffmpeg" in text_lower:
+    if ".c " in t or "c/c++" in t or "ffmpeg" in t:
         return "c"
-    if "python" in text_lower:
+    if "python" in t:
         return "python"
-    if "javascript" in text_lower or "node" in text_lower:
+    if "javascript" in t or "node" in t or "npm" in t:
         return "javascript"
+    if "go " in t or "golang" in t:
+        return "go"
+    if "ruby" in t or "rails" in t or "gem" in t:
+        return "ruby"
+    if "rust" in t or "cargo" in t:
+        return "rust"
     return "unknown"
 
 
-def _extract_scan_patterns(research_text: str, fix_text: str) -> list[str]:
-    """
-    Extract code patterns (grep-friendly) that indicate the vulnerable pattern.
-    Pulled from code blocks in research and fix docs.
-    """
-    patterns = []
-
-    # Pull patterns from RED FLAG blocks in the fix doc
-    red_flag_blocks = re.findall(r"RED FLAG.*?```.*?```", fix_text, re.DOTALL)
-    for block in red_flag_blocks:
-        code_match = re.search(r"```.*?\n(.*?)```", block, re.DOTALL)
-        if code_match:
-            code = code_match.group(1).strip()
-            # Take the most distinctive line as a grep pattern
-            lines = [l.strip() for l in code.splitlines() if l.strip() and not l.startswith("#")]
-            if lines:
-                patterns.append(lines[0])
-
-    # Fall back: pull from research vulnerability class section
-    if not patterns:
-        vuln_section = re.search(
-            r"### Root Cause(.*?)###", research_text, re.DOTALL
-        )
-        if vuln_section:
-            code_block = re.search(r"```.*?\n(.*?)```", vuln_section.group(1), re.DOTALL)
-            if code_block:
-                lines = [l.strip() for l in code_block.group(1).splitlines()
-                         if l.strip() and not l.startswith("//") and not l.startswith("#")]
-                if lines:
-                    patterns.append(lines[0])
-
-    # Hardcoded fallbacks for known hacks in this repo
-    if not patterns:
-        if "deserialization" in research_text.lower():
-            patterns = ["new ObjectInputStream(", "readObject()"]
-        elif "oob" in research_text.lower() or "out-of-bounds" in research_text.lower():
-            patterns = ["malloc(width * height)", "for (int i = 0; i < num_planes"]
-
-    return patterns or ["# no pattern extracted — review manually"]
+def _extract_fix_description(raw_fix: str) -> str:
+    m = re.search(r"## The Fix.*?\n(.*?)##", raw_fix, re.DOTALL)
+    return m.group(1).strip()[:500] if m else ""
 
 
 def load_hacks() -> list[Hack]:
     """
-    Scan research/ and fixes/ directories and return a list of Hack entries.
-    Pairs each research doc with its matching fix doc by shared date+name prefix.
+    Scan research/ and fixes/ directories.
+    Returns Hack objects with full structured discovery metadata.
     """
     research_dir = REPO_ROOT / "research"
     fixes_dir = REPO_ROOT / "fixes"
@@ -110,41 +155,41 @@ def load_hacks() -> list[Hack]:
         return []
 
     for research_file in sorted(research_dir.glob("*.md")):
-        stem = research_file.stem  # e.g. "2026-04-10_ffmpeg-oob-write"
+        stem = research_file.stem
         raw_research = research_file.read_text()
 
-        # Try to find matching fix doc
+        # Find matching fix doc
         fix_file = None
-        for candidate in fixes_dir.glob("*.md") if fixes_dir.exists() else []:
-            if stem.replace("_poc", "") in candidate.stem:
-                fix_file = candidate
-                break
-
+        if fixes_dir.exists():
+            for candidate in fixes_dir.glob("*.md"):
+                if stem.replace("_poc", "") in candidate.stem:
+                    fix_file = candidate
+                    break
         raw_fix = fix_file.read_text() if fix_file else ""
 
-        # Extract metadata
+        # Core fields
         severity = _extract_field(raw_research, "Severity")
         language = _infer_language(raw_research, stem)
-        scan_patterns = _extract_scan_patterns(raw_research, raw_fix)
-
-        # Build title from filename
         title = stem.split("_", 1)[-1].replace("-", " ").title()
         if ":" not in title:
             title = f"[{language.upper()}] {title}"
 
-        fix_description = ""
-        if raw_fix:
-            match = re.search(r"## The Fix.*?\n(.*?)##", raw_fix, re.DOTALL)
-            if match:
-                fix_description = match.group(1).strip()[:500]
+        # Structured discovery from profile
+        profile_key = _match_profile(raw_research, stem)
+        profile = _PROFILES.get(profile_key, {})
 
         hacks.append(Hack(
             id=stem,
             title=title,
             severity=severity or "Unknown",
             language=language,
-            scan_patterns=scan_patterns,
-            fix_description=fix_description or "See fix doc for details.",
+            infra_signals=profile.get("infra_signals", ["Dockerfile", ".github/workflows/*.yml"]),
+            os_signals=profile.get("os_signals", []),
+            language_files=profile.get("language_files", [f"*.{language}"]),
+            framework_signals=profile.get("framework_signals", []),
+            affected_libraries=profile.get("affected_libraries", []),
+            scan_patterns=profile.get("scan_patterns", []),
+            fix_description=_extract_fix_description(raw_fix) or "See fix doc.",
             research_path=research_file,
             fix_path=fix_file,
             raw_research=raw_research,
@@ -157,6 +202,11 @@ def load_hacks() -> list[Hack]:
 if __name__ == "__main__":
     for hack in load_hacks():
         print(f"[{hack.severity}] {hack.title}")
-        print(f"  Language : {hack.language}")
-        print(f"  Patterns : {hack.scan_patterns}")
+        print(f"  Language   : {hack.language}")
+        print(f"  Infra      : {hack.infra_signals}")
+        print(f"  OS         : {hack.os_signals}")
+        print(f"  Lang files : {hack.language_files}")
+        print(f"  Frameworks : {hack.framework_signals}")
+        print(f"  Libraries  : {[(l.name, l.vulnerable_versions) for l in hack.affected_libraries]}")
+        print(f"  Patterns   : {hack.scan_patterns}")
         print()

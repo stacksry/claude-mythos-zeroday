@@ -40,12 +40,67 @@ github_tools.py          ← GitHub API wrappers (scan, branch, PR, CI status)
 
 | Step | Agent | What it does |
 |---|---|---|
-| 1 | **Scanner** | Code-searches the GitHub org for each vulnerability pattern, reads matching files, filters false positives |
+| 1 | **Scanner** | 6-layer structured discovery across all org repos (see below) |
 | 2 | **Fixer** | Reads the vulnerable file, generates a minimal targeted fix, creates a branch, opens a PR |
 | 3 | **Tester** | Reads the PR diff, verifies the vulnerable pattern is removed and the fix is correctly applied |
 | 4 | **Reporter** | Calculates a hygiene score (0–100), generates a full markdown report with action items |
 
 Each agent uses `claude-opus-4-6` with **adaptive thinking** for deep reasoning on complex code.
+
+---
+
+### Structured Discovery (Scanner Layers)
+
+The scanner works through 6 layers per repo — each layer gates the next, so repos are ruled out early before expensive code-level analysis.
+
+```
+L1  Infrastructure    Dockerfiles, CI/CD workflows, Makefiles, Terraform, k8s
+        ↓
+L2  OS                Base images (FROM ubuntu, FROM alpine, FROM amazoncorretto, ...)
+        ↓
+L3  Language/Runtime  Build files: pom.xml, package.json, go.mod, requirements.txt, Gemfile, Cargo.toml
+        ↓
+L4  Frameworks        Spring Boot, Django, Express, Rails, Quarkus, FastAPI, Gin, ...
+        ↓
+L5  Library Versions  Parses manifests → checks if affected library version is in vulnerable range
+        ↓  ← most important for dependency-based vulns
+L6  Code Patterns     Grep for vulnerable code, reads file to confirm (rules out comments/tests)
+```
+
+Each hack in the registry carries explicit signals per layer:
+
+```python
+Hack(
+    infra_signals    = ["Dockerfile", ".github/workflows/*.yml"],
+    os_signals       = ["FROM openjdk", "FROM eclipse-temurin"],
+    language_files   = ["pom.xml", "*.java"],
+    framework_signals= ["spring-boot", "struts"],
+    affected_libraries = [
+        AffectedLibrary("commons-collections", "maven", "< 3.2.2", safe_version="3.2.2"),
+        AffectedLibrary("jackson-databind",    "maven", "< 2.14.0", safe_version="2.14.0"),
+    ],
+    scan_patterns    = ["new ObjectInputStream(", "readObject()"],
+)
+```
+
+The scanner result includes a `discovery_summary` per impacted repo showing exactly which layer triggered the finding:
+
+```json
+{
+  "repo": "org/backend-service",
+  "layer_hit": "L5",
+  "affected_library": "commons-collections@3.2.1",
+  "confidence": "high",
+  "discovery_summary": {
+    "infra": ["Dockerfile"],
+    "os": ["eclipse-temurin:17"],
+    "language": ["java"],
+    "frameworks": ["spring-boot"],
+    "vulnerable_libs": ["commons-collections@3.2.1"],
+    "code_pattern": "new ObjectInputStream("
+  }
+}
+```
 
 ### Setup
 
