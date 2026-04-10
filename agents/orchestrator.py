@@ -32,10 +32,13 @@ from dotenv import load_dotenv
 
 from hack_registry import load_hacks, Hack
 import scanner_agent
-import fixer_agent
-import tester_agent
+import supply_chain_agent
 import validator_agent
 import triage_agent
+import sandbox_agent
+import alert_agent
+import fixer_agent
+import tester_agent
 from reporter_agent import generate_report, HackResult
 
 
@@ -86,24 +89,31 @@ async def _process_hack(
 
         print(f"\n[{idx}/{total}] {hack.title} ({hack.severity})")
 
-        # ── Step 1: Scan (parallel file batches via ranker) ──────────────
-        print(f"  [SCAN] Ranking + scanning org '{org}'...")
-        # Run blocking scanner in thread pool so we don't block the event loop
         loop = asyncio.get_event_loop()
-        impacted = await loop.run_in_executor(None, scanner_agent.scan, org, hack)
+
+        # ── Step 1: Scanner + Supply Chain (parallel) ─────────────────────
+        print(f"  [SCAN] Ranking + scanning org '{org}' (code patterns + transitive deps)...")
+        code_task = loop.run_in_executor(None, scanner_agent.scan, org, hack)
+        sc_task   = loop.run_in_executor(None, supply_chain_agent.scan_org, org, hack)
+        code_findings, sc_results = await asyncio.gather(code_task, sc_task)
+
+        # Merge supply-chain findings into scanner format
+        sc_findings = supply_chain_agent.findings_to_scanner_format(sc_results, hack)
+        impacted = code_findings + sc_findings
         result.impacted_repos = impacted
 
         if not impacted:
             print(f"  [SCAN] No impacted repos found for {hack.id}")
             return result
 
-        print(f"  [SCAN] {len(impacted)} finding(s):")
+        print(f"  [SCAN] {len(impacted)} finding(s) "
+              f"(code={len(code_findings)}, supply_chain={len(sc_findings)}):")
         for f in impacted:
             print(f"    - {f.get('repo')} / {f.get('file')} "
                   f"[{f.get('layer_hit', 'L?')}] confidence={f.get('confidence', '?')}")
 
         # ── Step 2: Validate — filter false positives ─────────────────────
-        print(f"  [VALIDATE] Running noise filter...")
+        print(f"  [VALIDATE] Running noise filter on {len(impacted)} finding(s)...")
         confirmed = await loop.run_in_executor(
             None, validator_agent.validate_batch, impacted, hack
         )
@@ -114,10 +124,46 @@ async def _process_hack(
 
         print(f"  [VALIDATE] {len(confirmed)}/{len(impacted)} findings confirmed.")
 
-        # ── Step 3: Triage — CVSS score + route ──────────────────────────
-        print(f"  [TRIAGE] CVSS scoring and routing...")
-        queues = await loop.run_in_executor(
+        # ── Step 3: Sandbox — structural exploit confirmation ─────────────
+        print(f"  [SANDBOX] Confirming exploitability in isolated containers...")
+        triage_records_for_sandbox = []
+        # We need triage records to pass to sandbox; do a quick pre-triage
+        quick_queues = await loop.run_in_executor(
             None, triage_agent.triage_batch, confirmed, hack
+        )
+        all_records = (
+            quick_queues.get("human_review", []) +
+            quick_queues.get("auto_fix", []) +
+            quick_queues.get("auto_fix_batched", []) +
+            quick_queues.get("backlog", [])
+        )
+        sandbox_results = {}
+        for finding, record in all_records:
+            sb = await loop.run_in_executor(
+                None, sandbox_agent.run_sandbox, record, "", hack
+            )
+            sandbox_results[record.finding_id] = sb
+            verdict_str = "EXPLOITABLE" if sb.verdict == "CONFIRMED_EXPLOITABLE" else sb.verdict
+            print(f"    {record.finding_id[:12]}... → {verdict_str}")
+
+        # Filter out NOT_REPRODUCIBLE findings (retain SANDBOX_ERROR — Docker may not be available)
+        confirmed_exploitable = [
+            (f, r) for f, r in all_records
+            if sandbox_results.get(r.finding_id, None) is None
+            or sandbox_results[r.finding_id].verdict != "NOT_REPRODUCIBLE"
+        ]
+        print(f"  [SANDBOX] {len(confirmed_exploitable)}/{len(all_records)} findings pass sandbox.")
+
+        if not confirmed_exploitable:
+            print(f"  [VALIDATE] All findings not reproducible in sandbox — skipping.")
+            return result
+
+        # ── Step 4: Triage — final CVSS score + route ────────────────────
+        # Re-triage only the sandbox-confirmed set
+        confirmed_findings = [f for f, r in confirmed_exploitable]
+        print(f"  [TRIAGE] CVSS scoring and routing {len(confirmed_findings)} confirmed finding(s)...")
+        queues = await loop.run_in_executor(
+            None, triage_agent.triage_batch, confirmed_findings, hack
         )
 
         human = queues.get("human_review", [])
@@ -125,7 +171,15 @@ async def _process_hack(
         backlog = queues.get("backlog", [])
 
         if human:
-            print(f"  [TRIAGE] ⚠️  {len(human)} finding(s) → HUMAN REVIEW REQUIRED")
+            print(f"  [TRIAGE] {len(human)} finding(s) → HUMAN REVIEW REQUIRED")
+
+        # ── Step 5: Alert — notify humans for critical/high findings ──────
+        if human:
+            print(f"  [ALERT] Firing human review notifications...")
+            await loop.run_in_executor(
+                None, alert_agent.fire_alerts_for_queue, human
+            )
+
         if auto:
             print(f"  [TRIAGE] {len(auto)} finding(s) → auto-fix pipeline")
         if backlog:
@@ -135,14 +189,14 @@ async def _process_hack(
             print(f"  [DRY RUN] Skipping fix and test steps.")
             return result
 
-        # ── Step 4: Fix (auto-fix queue only; human_review needs sign-off) ─
-        fix_targets = auto  # Human review queue handled separately
+        # ── Step 6: Fix (auto-fix queue only; human_review needs sign-off) ─
+        fix_targets = auto
         if not fix_targets:
             if human:
                 print(f"  [FIX] Critical findings queued for human review — skipping auto-fix.")
             return result
 
-        for finding, triage_record in fix_targets:
+        for finding, triage_record in fix_targets:  # type: ignore[assignment]
             repo_name = finding.get("repo")
             file_path = finding.get("file")
             print(f"\n  [FIX] {repo_name} / {file_path} (CVSS {triage_record.cvss_score})...")

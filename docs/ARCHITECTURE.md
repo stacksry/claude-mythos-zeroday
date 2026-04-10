@@ -42,6 +42,8 @@
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        ORCHESTRATOR (async)                         │
 │              Processes hacks in parallel via asyncio                │
+│              Priority queue: Critical → High → Medium → Low         │
+│              --workers N for surge mode                             │
 └──────────┬──────────────────────────────────────────────────────────┘
            │
            ▼
@@ -59,6 +61,15 @@
 │                         │  (one per file batch / repo)         │   │
 │                         └──────────────────────────────────────┘   │
 │                                        │                           │
+│  ┌──────────────────────────────────┐  │                           │
+│  │     supply_chain_agent          │  │                           │
+│  │                                  │  │                           │
+│  │  Parses lockfiles (poetry.lock,  │──┤  Runs in parallel with    │
+│  │  package-lock.json, go.sum,      │  │  scanner_agent            │
+│  │  Cargo.lock, Gemfile.lock, ...)  │  │                           │
+│  │  Checks full transitive dep tree │  │                           │
+│  │  — finds vulns 3 levels deep     │  │                           │
+│  └──────────────────────────────────┘  │                           │
 │                                        ▼                           │
 │                         ┌──────────────────────────────────────┐   │
 │                         │       validator_agent                │   │
@@ -66,21 +77,46 @@
 │                         │  Secondary noise filter — confirms   │   │
 │                         │  each finding is real + exploitable  │   │
 │                         └──────────────────────────────────────┘   │
+│                                        │                           │
+│                                        ▼                           │
+│                         ┌──────────────────────────────────────┐   │
+│                         │       sandbox_agent                  │   │
+│                         │                                      │   │
+│                         │  Structural exploit confirmation:    │   │
+│                         │  1. Claude generates minimal PoC     │   │
+│                         │  2. Runs in isolated Docker          │   │
+│                         │     (--network none, --memory 256m,  │   │
+│                         │      --read-only, 30s timeout)       │   │
+│                         │  3. ASan/sanitizer output parsed     │   │
+│                         │  Verdicts: CONFIRMED_EXPLOITABLE /   │   │
+│                         │           NOT_REPRODUCIBLE /         │   │
+│                         │           SANDBOX_ERROR              │   │
+│                         └──────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
            │
            ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  PHASE 2: TRIAGE                                                    │
+│  PHASE 2: TRIAGE + ALERT                                            │
 │                                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐  │
 │  │                     triage_agent                             │  │
 │  │                                                              │  │
-│  │  Severity assessment (CVSS) → routes by severity:           │  │
+│  │  Severity assessment (CVSS v3.1) → routes by severity:      │  │
 │  │                                                              │  │
-│  │  Critical ──▶ human_review queue (Slack/email alert)        │  │
-│  │  High     ──▶ auto-fix pipeline                             │  │
+│  │  Critical ──▶ human_review queue ──▶ alert_agent            │  │
+│  │  High     ──▶ human_review + alert ──▶ auto-fix pipeline    │  │
 │  │  Medium   ──▶ auto-fix pipeline (batched)                   │  │
 │  │  Low      ──▶ backlog tracker                               │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                     alert_agent                              │  │
+│  │                                                              │  │
+│  │  Fires on human_review queue findings:                       │  │
+│  │  → Slack  (SLACK_WEBHOOK_URL)                               │  │
+│  │  → Email  (SMTP_HOST + ALERT_EMAIL_TO)                      │  │
+│  │  → PagerDuty (PAGERDUTY_ROUTING_KEY) — Critical/High only   │  │
+│  │  Logs to reports/alerts/{finding_id}_alert.json             │  │
 │  └──────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
            │
@@ -116,6 +152,50 @@
 ---
 
 ## Agent Responsibilities
+
+### `supply_chain_agent.py` ← NEW
+Scans the **full transitive dependency tree** — not just direct dependencies.
+
+Parses 11 lockfile formats: `package-lock.json`, `yarn.lock`, `poetry.lock`, `Pipfile.lock`,
+`requirements.txt`, `go.sum`, `Gemfile.lock`, `Cargo.lock`, `packages.lock.json`,
+`gradle.lockfile`. Checks resolved versions against `affected_libraries` ranges using
+semver comparison. Produces findings in scanner format so they flow into
+validator → triage → fixer unchanged. Runs in parallel with the scanner in the orchestrator.
+
+**Why:** 60–70% of real-world vulnerable dependency exposure is transitive, not direct.
+A repo's `pom.xml` may not list `commons-collections` directly — it's pulled in 3 levels
+deep via `spring-boot → hibernate → commons-collections@3.2.1`.
+
+---
+
+### `sandbox_agent.py` ← NEW
+Structural exploit confirmation via isolated Docker containers. Eliminates the ~11%
+false-positive gap that remains after the validator's reasoning-based check.
+
+Flow:
+1. Claude generates a minimal, self-contained PoC for the vulnerability
+2. PoC is written to a temp dir and mounted into Docker
+   (`--network none`, `--memory 256m`, `--cpus 0.5`, `--read-only`, 30s timeout)
+3. Output is parsed for crash indicators (ASan errors, uncaught exceptions, panics)
+4. Verdict: CONFIRMED_EXPLOITABLE → continues to triage; NOT_REPRODUCIBLE → dropped
+
+Graceful degradation: if Docker is unavailable, returns SANDBOX_ERROR and the finding
+continues through the pipeline (never silently drops findings).
+
+---
+
+### `alert_agent.py` ← NEW
+Fires human review notifications for Critical and High findings.
+
+| Channel | Config | Trigger |
+|---|---|---|
+| Slack | `SLACK_WEBHOOK_URL` | All human_review findings |
+| Email | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `ALERT_EMAIL_TO` | All human_review findings |
+| PagerDuty | `PAGERDUTY_ROUTING_KEY` | Critical + High only |
+
+Each channel is attempted independently. Logs results to `reports/alerts/{finding_id}_alert.json`.
+
+---
 
 ### `ranker_agent.py` ← NEW
 Scores every file in a repo 1–5 on vulnerability likelihood **before** the scanner runs.

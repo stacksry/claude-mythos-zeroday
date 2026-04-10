@@ -2,3 +2,4 @@ anthropic>=0.40.0
 PyGitHub>=2.3.0
 python-dotenv>=1.0.0
 requests>=2.31.0
+docker>=7.0.0          # sandbox_agent: Docker SDK for Python
